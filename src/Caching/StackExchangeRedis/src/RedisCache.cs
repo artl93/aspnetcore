@@ -30,13 +30,61 @@ public partial class RedisCache : IBufferDistributedCache, IDisposable
     private const string SlidingExpirationKey = "sldexp";
     private const string DataKey = "data";
 
-    // combined keys - same hash keys fetched constantly; avoid allocating an array each time
-    private static readonly RedisValue[] _hashMembersAbsoluteExpirationSlidingExpirationData = [AbsoluteExpirationKey, SlidingExpirationKey, DataKey];
-    private static readonly RedisValue[] _hashMembersAbsoluteExpirationSlidingExpiration = [AbsoluteExpirationKey, SlidingExpirationKey];
+    private const int GetAndRefreshMetadata = 0;
+    private const int GetAndRefreshData = 1;
+    private const int GetAndRefreshMetadataIfDataExists = 2;
 
-    private static RedisValue[] GetHashFields(bool getData) => getData
-        ? _hashMembersAbsoluteExpirationSlidingExpirationData
-        : _hashMembersAbsoluteExpirationSlidingExpiration;
+    // Split ticks into millisecond and remainder components so Lua never converts 18-digit tick values to doubles.
+    private const string GetAndRefreshScript = """
+        local mode = tonumber(ARGV[2])
+        local values
+        if mode == 1 then
+            values = redis.call('HMGET', KEYS[1], 'absexp', 'sldexp', 'data')
+        else
+            values = redis.call('HMGET', KEYS[1], 'absexp', 'sldexp')
+        end
+
+        local sliding = values[2]
+        if sliding and sliding ~= '-1' and (mode ~= 2 or redis.call('HEXISTS', KEYS[1], 'data') == 1) then
+            local function ticks_to_milliseconds(ticks)
+                local negative = string.sub(ticks, 1, 1) == '-'
+                if negative then
+                    ticks = string.sub(ticks, 2)
+                end
+                local length = string.len(ticks)
+                local milliseconds = length > 4 and tonumber(string.sub(ticks, 1, length - 4)) or 0
+                return negative and -milliseconds or milliseconds
+            end
+
+            local expiration = ticks_to_milliseconds(sliding)
+            local absolute = values[1]
+            if absolute and absolute ~= '-1' then
+                local absolute_length = string.len(absolute)
+                local absolute_milliseconds = absolute_length > 4 and tonumber(string.sub(absolute, 1, absolute_length - 4)) or 0
+                local absolute_remainder = absolute_length > 4 and tonumber(string.sub(absolute, absolute_length - 3)) or tonumber(absolute)
+
+                local now = ARGV[1]
+                local now_length = string.len(now)
+                local now_milliseconds = now_length > 4 and tonumber(string.sub(now, 1, now_length - 4)) or 0
+                local now_remainder = now_length > 4 and tonumber(string.sub(now, now_length - 3)) or tonumber(now)
+
+                local relative = absolute_milliseconds - now_milliseconds
+                if relative > 0 and absolute_remainder < now_remainder then
+                    relative = relative - 1
+                elseif relative < 0 and absolute_remainder > now_remainder then
+                    relative = relative + 1
+                end
+
+                if relative < expiration then
+                    expiration = relative
+                end
+            end
+
+            redis.call('PEXPIRE', KEYS[1], expiration)
+        end
+
+        return values
+        """;
 
     private const long NotPresent = -1;
 
@@ -395,26 +443,15 @@ public partial class RedisCache : IBufferDistributedCache, IDisposable
 
         var cache = Connect();
 
-        // This also resets the LRU status as desired.
-        // TODO: Can this be done in one operation on the server side? Probably, the trick would just be the DateTimeOffset math.
         RedisValue[] results;
         try
         {
-            results = cache.HashGet(_instancePrefix.Append(key), GetHashFields(getData));
+            results = ExecuteGetAndRefresh(cache, _instancePrefix.Append(key), getData ? GetAndRefreshData : GetAndRefreshMetadata);
         }
         catch (Exception ex)
         {
             OnRedisError(ex, cache);
             throw;
-        }
-
-        if (results.Length >= 2)
-        {
-            MapMetadata(results, out DateTimeOffset? absExpr, out TimeSpan? sldExpr);
-            if (sldExpr.HasValue)
-            {
-                Refresh(cache, key, absExpr, sldExpr.GetValueOrDefault());
-            }
         }
 
         if (results.Length >= 3 && !results[2].IsNull)
@@ -434,27 +471,20 @@ public partial class RedisCache : IBufferDistributedCache, IDisposable
         var cache = await ConnectAsync(token).ConfigureAwait(false);
         Debug.Assert(cache is not null);
 
-        // This also resets the LRU status as desired.
-        // TODO: Can this be done in one operation on the server side? Probably, the trick would just be the DateTimeOffset math.
         RedisValue[] results;
         try
         {
-            results = await cache.HashGetAsync(_instancePrefix.Append(key), GetHashFields(getData)).ConfigureAwait(false);
+            results = await ExecuteGetAndRefreshAsync(
+                cache,
+                _instancePrefix.Append(key),
+                getData ? GetAndRefreshData : GetAndRefreshMetadata).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             OnRedisError(ex, cache);
             throw;
         }
-
-        if (results.Length >= 2)
-        {
-            MapMetadata(results, out DateTimeOffset? absExpr, out TimeSpan? sldExpr);
-            if (sldExpr.HasValue)
-            {
-                await RefreshAsync(cache, key, absExpr, sldExpr.GetValueOrDefault(), token).ConfigureAwait(false);
-            }
-        }
+        token.ThrowIfCancellationRequested();
 
         if (results.Length >= 3 && !results[2].IsNull)
         {
@@ -463,6 +493,18 @@ public partial class RedisCache : IBufferDistributedCache, IDisposable
 
         return null;
     }
+
+    private static RedisValue[] ExecuteGetAndRefresh(IDatabase cache, RedisKey key, int mode)
+        => (RedisValue[]?)cache.ScriptEvaluate(
+            GetAndRefreshScript,
+            [key],
+            [DateTimeOffset.UtcNow.Ticks, mode]) ?? [];
+
+    private static async Task<RedisValue[]> ExecuteGetAndRefreshAsync(IDatabase cache, RedisKey key, int mode)
+        => (RedisValue[]?)await cache.ScriptEvaluateAsync(
+            GetAndRefreshScript,
+            [key],
+            [DateTimeOffset.UtcNow.Ticks, mode]).ConfigureAwait(false) ?? [];
 
     /// <inheritdoc />
     public void Remove(string key)
@@ -492,76 +534,6 @@ public partial class RedisCache : IBufferDistributedCache, IDisposable
         try
         {
             await cache.KeyDeleteAsync(_instancePrefix.Append(key)).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            OnRedisError(ex, cache);
-            throw;
-        }
-    }
-
-    private static void MapMetadata(RedisValue[] results, out DateTimeOffset? absoluteExpiration, out TimeSpan? slidingExpiration)
-    {
-        absoluteExpiration = null;
-        slidingExpiration = null;
-        var absoluteExpirationTicks = (long?)results[0];
-        if (absoluteExpirationTicks.HasValue && absoluteExpirationTicks.Value != NotPresent)
-        {
-            absoluteExpiration = new DateTimeOffset(absoluteExpirationTicks.Value, TimeSpan.Zero);
-        }
-        var slidingExpirationTicks = (long?)results[1];
-        if (slidingExpirationTicks.HasValue && slidingExpirationTicks.Value != NotPresent)
-        {
-            slidingExpiration = new TimeSpan(slidingExpirationTicks.Value);
-        }
-    }
-
-    private void Refresh(IDatabase cache, string key, DateTimeOffset? absExpr, TimeSpan sldExpr)
-    {
-        ArgumentNullThrowHelper.ThrowIfNull(key);
-
-        // Note Refresh has no effect if there is just an absolute expiration (or neither).
-        TimeSpan? expr;
-        if (absExpr.HasValue)
-        {
-            var relExpr = absExpr.Value - DateTimeOffset.Now;
-            expr = relExpr <= sldExpr ? relExpr : sldExpr;
-        }
-        else
-        {
-            expr = sldExpr;
-        }
-        try
-        {
-            cache.KeyExpire(_instancePrefix.Append(key), expr);
-        }
-        catch (Exception ex)
-        {
-            OnRedisError(ex, cache);
-            throw;
-        }
-    }
-
-    private async Task RefreshAsync(IDatabase cache, string key, DateTimeOffset? absExpr, TimeSpan sldExpr, CancellationToken token)
-    {
-        ArgumentNullThrowHelper.ThrowIfNull(key);
-
-        token.ThrowIfCancellationRequested();
-
-        // Note Refresh has no effect if there is just an absolute expiration (or neither).
-        TimeSpan? expr;
-        if (absExpr.HasValue)
-        {
-            var relExpr = absExpr.Value - DateTimeOffset.Now;
-            expr = relExpr <= sldExpr ? relExpr : sldExpr;
-        }
-        else
-        {
-            expr = sldExpr;
-        }
-        try
-        {
-            await cache.KeyExpireAsync(_instancePrefix.Append(key), expr).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -704,16 +676,13 @@ public partial class RedisCache : IBufferDistributedCache, IDisposable
 
         var cache = Connect();
 
-        // This also resets the LRU status as desired.
-        // TODO: Can this be done in one operation on the server side? Probably, the trick would just be the DateTimeOffset math.
-        RedisValue[] metadata;
         Lease<byte>? data;
         try
         {
             var prefixed = _instancePrefix.Append(key);
-            var pendingMetadata = cache.HashGetAsync(prefixed, GetHashFields(false));
+            var pendingRefresh = ExecuteGetAndRefreshAsync(cache, prefixed, GetAndRefreshMetadataIfDataExists);
             data = cache.HashGetLease(prefixed, DataKey);
-            metadata = pendingMetadata.GetAwaiter().GetResult();
+            _ = pendingRefresh.GetAwaiter().GetResult();
             // ^^^ this *looks* like a sync-over-async, but the FIFO nature of
             // redis means that since HashGetLease has returned: *so has this*;
             // all we're actually doing is getting rid of a latency delay
@@ -726,15 +695,6 @@ public partial class RedisCache : IBufferDistributedCache, IDisposable
 
         if (data is not null)
         {
-            if (metadata.Length >= 2)
-            {
-                MapMetadata(metadata, out DateTimeOffset? absExpr, out TimeSpan? sldExpr);
-                if (sldExpr.HasValue)
-                {
-                    Refresh(cache, key, absExpr, sldExpr.GetValueOrDefault());
-                }
-            }
-
             // this is where we actually copy the data out
             destination.Write(data.Span);
             data.Dispose(); // recycle the lease
@@ -753,16 +713,13 @@ public partial class RedisCache : IBufferDistributedCache, IDisposable
         var cache = await ConnectAsync(token).ConfigureAwait(false);
         Debug.Assert(cache is not null);
 
-        // This also resets the LRU status as desired.
-        // TODO: Can this be done in one operation on the server side? Probably, the trick would just be the DateTimeOffset math.
-        RedisValue[] metadata;
         Lease<byte>? data;
         try
         {
             var prefixed = _instancePrefix.Append(key);
-            var pendingMetadata = cache.HashGetAsync(prefixed, GetHashFields(false));
+            var pendingRefresh = ExecuteGetAndRefreshAsync(cache, prefixed, GetAndRefreshMetadataIfDataExists);
             data = await cache.HashGetLeaseAsync(prefixed, DataKey).ConfigureAwait(false);
-            metadata = await pendingMetadata.ConfigureAwait(false);
+            _ = await pendingRefresh.ConfigureAwait(false);
             // ^^^ inversion of order here is deliberate to avoid a latency delay
         }
         catch (Exception ex)
@@ -771,17 +728,14 @@ public partial class RedisCache : IBufferDistributedCache, IDisposable
             throw;
         }
 
+        if (token.IsCancellationRequested)
+        {
+            data?.Dispose();
+            token.ThrowIfCancellationRequested();
+        }
+
         if (data is not null)
         {
-            if (metadata.Length >= 2)
-            {
-                MapMetadata(metadata, out DateTimeOffset? absExpr, out TimeSpan? sldExpr);
-                if (sldExpr.HasValue)
-                {
-                    await RefreshAsync(cache, key, absExpr, sldExpr.GetValueOrDefault(), token).ConfigureAwait(false);
-                }
-            }
-
             // this is where we actually copy the data out
             destination.Write(data.Span);
             data.Dispose(); // recycle the lease
