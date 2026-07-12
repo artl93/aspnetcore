@@ -18,6 +18,8 @@ namespace Microsoft.Extensions.Caching.StackExchangeRedis;
 public class RedisCacheGetAndRefreshTests
 {
     private const string EnabledEnvironmentVariable = "REDISCACHETESTS_ENABLED";
+    private const string EvalDisabledEnvironmentVariable = "REDISCACHETESTS_EVAL_DISABLED_ENABLED";
+    private const string ScriptingDisabledEnvironmentVariable = "REDISCACHETESTS_SCRIPTING_DISABLED_ENABLED";
     private const string Key = "key";
     private static readonly byte[] _value = [1, 2, 3];
 
@@ -302,6 +304,79 @@ public class RedisCacheGetAndRefreshTests
         Assert.Single(commands);
     }
 
+    [ConditionalTheory]
+    [EnvironmentVariableSkipCondition(EnabledEnvironmentVariable, "1")]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task TryGetWithSlidingExpirationPipelinesRedisCommands(bool useAsync)
+    {
+        var session = new ProfilingSession();
+        using var connection = await ConnectionMultiplexer.ConnectAsync("localhost:6379");
+        using var cache = CreateCache(connection, out _, session);
+        cache.Set(Key, _value, new DistributedCacheEntryOptions().SetSlidingExpiration(TimeSpan.FromSeconds(3)));
+        _ = session.FinishProfiling().ToArray();
+        var destination = new TestBufferWriter();
+        var bufferCache = (IBufferDistributedCache)cache;
+
+        var found = useAsync
+            ? await bufferCache.TryGetAsync(Key, destination, default)
+            : bufferCache.TryGet(Key, destination);
+        var commands = session.FinishProfiling().OrderBy(command => command.CommandCreated).ToArray();
+
+        Assert.True(found);
+        Assert.Equal(["EVAL", "HGET"], commands.Select(command => command.Command).ToArray());
+        var firstResponse = commands[0].CommandCreated
+            + commands[0].CreationToEnqueued
+            + commands[0].EnqueuedToSending
+            + commands[0].SentToResponse;
+        Assert.True(commands[1].CommandCreated < firstResponse);
+    }
+
+    [ConditionalFact]
+    [EnvironmentVariableSkipCondition(EnabledEnvironmentVariable, "1")]
+    public async Task GetRecoversAfterScriptCacheFlushAndNewConnection()
+    {
+        var instanceName = $"{nameof(GetRecoversAfterScriptCacheFlushAndNewConnection)}:{Guid.NewGuid()}:";
+
+        using (var connection = await ConnectionMultiplexer.ConnectAsync("localhost:6379,AllowAdmin=true"))
+        using (var cache = CreateCache(connection, out _, instanceName: instanceName))
+        {
+            cache.Set(Key, _value, new DistributedCacheEntryOptions().SetSlidingExpiration(TimeSpan.FromSeconds(3)));
+            Assert.Equal(_value, cache.Get(Key));
+
+            var server = connection.GetServer(connection.GetEndPoints().Single());
+            await server.ScriptFlushAsync();
+            Assert.Equal(_value, await cache.GetAsync(Key));
+            await server.ScriptFlushAsync();
+        }
+
+        using var newConnection = await ConnectionMultiplexer.ConnectAsync("localhost:6379");
+        using var newCache = CreateCache(newConnection, out _, instanceName: instanceName);
+        Assert.Equal(_value, await newCache.GetAsync(Key));
+    }
+
+    [ConditionalFact]
+    [EnvironmentVariableSkipCondition(EvalDisabledEnvironmentVariable, "1")]
+    public async Task GetThrowsWhenEvalCommandIsDisabled()
+    {
+        using var connection = await ConnectionMultiplexer.ConnectAsync("localhost:6380");
+        using var cache = CreateCache(connection, out _);
+        cache.Set(Key, _value, new DistributedCacheEntryOptions().SetSlidingExpiration(TimeSpan.FromSeconds(3)));
+
+        await Assert.ThrowsAsync<RedisServerException>(() => cache.GetAsync(Key));
+    }
+
+    [ConditionalFact]
+    [EnvironmentVariableSkipCondition(ScriptingDisabledEnvironmentVariable, "1")]
+    public async Task GetThrowsWhenScriptingCommandsAreDisabled()
+    {
+        using var connection = await ConnectionMultiplexer.ConnectAsync("localhost:6381");
+        using var cache = CreateCache(connection, out _);
+        cache.Set(Key, _value, new DistributedCacheEntryOptions().SetSlidingExpiration(TimeSpan.FromSeconds(3)));
+
+        await Assert.ThrowsAsync<RedisServerException>(() => cache.GetAsync(Key));
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -357,9 +432,10 @@ public class RedisCacheGetAndRefreshTests
     private static RedisCache CreateCache(
         ConnectionMultiplexer connection,
         out RedisKey redisKey,
-        ProfilingSession profilingSession = null)
+        ProfilingSession profilingSession = null,
+        string instanceName = null)
     {
-        var instanceName = $"{nameof(RedisCacheGetAndRefreshTests)}:{Guid.NewGuid()}:";
+        instanceName ??= $"{nameof(RedisCacheGetAndRefreshTests)}:{Guid.NewGuid()}:";
         redisKey = instanceName + Key;
 
         return new RedisCache(new RedisCacheOptions
